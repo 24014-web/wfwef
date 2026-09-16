@@ -1,0 +1,8 @@
+.local_opinion_ai/
+.test_journal/
+__pycache__/
+*.pyc
+*.lca
+*.zip
+.genocide_history/
+

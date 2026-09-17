@@ -103,6 +103,25 @@ guaranteed five pages every second. Crawls use fast DEFLATE by default; the
 older `LosslessArchive(..., compression="auto")` path remains available when
 minimum archive size matters more than speed.
 
+Use repeatable `--block-word` and `--block-site` options to skip unwanted
+URLs/pages. Words are checked against the URL, title, and visible text; sites
+match a domain and its subdomains, or a domain path such as
+`example.org/login`. `--code-only` stores recognized source files, notebooks,
+raw/blob files, and archive content while traversing repository directories
+only to find those files. For example:
+
+```text
+python lossless_web_archive.py crawl --topic "Python reinforcement learning" \
+  --code-only --block-word login --block-word subscribe \
+  --block-site facebook.com --block-site example.org/login \
+  --workers 5 --max-pages 500 --archive code-only.zip
+```
+
+Navigation pages are reported as `code_filtered` and are never written to the
+archive. A blocked URL is rejected before its request; a page whose title or
+body contains a blocked word is discarded after extraction and its links are
+not followed.
+
 ### Deep sites and Software Heritage
 
 The lossless crawler follows ordinary HTML links and has a built-in adapter for
@@ -147,6 +166,9 @@ shows search results, checks each result before crawling it, and keeps a live
 log with the URL, site, downloaded bytes, extracted text bytes, compression
 method, stored size, content kind, and training score. The **Training mode**
 checkbox controls the cleaning and quality gate; it is enabled by default.
+The crawl form also accepts block words and domains, and its **Code-bearing
+pages only** toggle keeps repository/archive navigation out of the archive
+while still following it to reach raw source files.
 
 ```text
 python crawl_ui.py

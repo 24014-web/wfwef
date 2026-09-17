@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import html
 import json
@@ -277,10 +278,9 @@ def search_web(query: str, limit: int = 8, timeout: float = 20.0) -> list[dict[s
 
     This is best-effort discovery, not a claim to index the whole internet. The
     returned pages still need to be fetched and evaluated by the local journal.
-    A server-rendered Seznam result page is attempted first because it gives
-    this dependency-free prototype usable links in environments where Bing is
-    localized or returns an unrelated result set. Bing and DuckDuckGo remain
-    fallbacks.
+    The three server-rendered providers are queried concurrently.  This avoids
+    waiting for a slow provider before trying the next one while keeping the
+    dependency-free prototype usable when one provider is unavailable.
     """
     encoded = urllib.parse.quote_plus(query)
     providers = [
@@ -288,8 +288,7 @@ def search_web(query: str, limit: int = 8, timeout: float = 20.0) -> list[dict[s
         (f"https://www.bing.com/search?q={encoded}&setlang=en-us&cc=us", "bing"),
         (f"https://html.duckduckgo.com/html/?q={encoded}", "duckduckgo"),
     ]
-    last_error: Exception | None = None
-    for endpoint, provider in providers:
+    def fetch_provider(endpoint: str, provider: str) -> list[dict[str, str]]:
         request = urllib.request.Request(
             endpoint,
             headers={
@@ -303,8 +302,7 @@ def search_web(query: str, limit: int = 8, timeout: float = 20.0) -> list[dict[s
                 raw = response.read(2_000_000)
                 charset = response.headers.get_content_charset() or "utf-8"
         except (urllib.error.HTTPError, urllib.error.URLError) as exc:
-            last_error = exc
-            continue
+            raise RuntimeError(f"{provider}: {type(exc).__name__}") from exc
         try:
             page = raw.decode(charset, errors="replace")
         except LookupError:
@@ -321,18 +319,52 @@ def search_web(query: str, limit: int = 8, timeout: float = 20.0) -> list[dict[s
             parser.feed(page)
             parser.close()
             parsed_results = parser.results
-        unique: list[dict[str, str]] = []
-        seen: set[str] = set()
-        for result in parsed_results:
-            if result["url"] not in seen:
-                unique.append(result)
-                seen.add(result["url"])
-            if len(unique) >= max(1, limit):
+        return [
+            {"title": str(result.get("title", "")), "url": str(result.get("url", "")), "provider": provider}
+            for result in parsed_results
+            if result.get("title") and result.get("url")
+        ]
+
+    provider_results: dict[str, list[dict[str, str]]] = {}
+    errors: list[Exception] = []
+    with ThreadPoolExecutor(max_workers=len(providers), thread_name_prefix="search") as executor:
+        futures = {
+            executor.submit(fetch_provider, endpoint, provider): provider
+            for endpoint, provider in providers
+        }
+        for future in as_completed(futures):
+            provider = futures[future]
+            try:
+                provider_results[provider] = future.result()
+            except Exception as exc:
+                errors.append(exc)
+
+    safe_limit = max(1, int(limit))
+    unique: list[dict[str, str]] = []
+    seen: set[str] = set()
+    tracking = {"fbclid", "gclid", "mc_cid", "mc_eid", "msclkid", "ref", "ref_"}
+    # Preserve the stable provider preference while merging the fastest
+    # responses.  URL keys discard common analytics parameters.
+    for _, provider in providers:
+        for result in provider_results.get(provider, []):
+            parsed = urllib.parse.urlparse(result["url"])
+            query_parts = [
+                (key, value)
+                for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+                if key.casefold() not in tracking and not key.casefold().startswith("utm_")
+            ]
+            query_parts.sort()
+            key = urllib.parse.urlunparse((parsed.scheme.casefold(), parsed.netloc.casefold(), parsed.path or "/", "", urllib.parse.urlencode(query_parts), ""))
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            unique.append(result)
+            if len(unique) >= safe_limit:
                 return unique
-        if unique:
-            return unique
-    if last_error is not None:
-        raise RuntimeError(f"Could not search the web: {last_error}") from last_error
+    if unique:
+        return unique
+    if errors:
+        raise RuntimeError(f"Could not search the web: {errors[0]}") from errors[0]
     return []
 
 

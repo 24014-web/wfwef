@@ -35,6 +35,8 @@ from lossless_web_archive import (
     canonicalize_url,
     is_software_heritage_search_url,
     make_record,
+    normalize_block_sites,
+    normalize_filter_values,
     normalize_url,
     robots_allowed,
     run_parallel_crawl,
@@ -120,6 +122,7 @@ class CrawlJob:
                     "pages": 0,
                     "stored": 0,
                     "filtered": 0,
+                    "code_filtered": 0,
                     "duplicates": 0,
                     "failed": 0,
                     "source_bytes": 0,
@@ -229,6 +232,26 @@ class CrawlJob:
                 "details": "robots.txt disallowed this URL",
             })
             return
+        if status == "blocked":
+            page = event.get("page") or {}
+            page_url = str(page.get("url") or url)
+            host = str(event.get("host") or domain_for(page_url))
+            source_bytes = int(event.get("source_bytes", page.get("source_bytes", 0)) or 0)
+            text_bytes = int(event.get("text_bytes", len(str(page.get("text", "")).encode("utf-8"))) or 0)
+            if page:
+                self._count("checked")
+                self._site_update(host, pages=1, filtered=1, source_bytes=source_bytes, text_bytes=text_bytes)
+            self._count("blocked")
+            self._log({
+                "url": page_url,
+                "site": host,
+                "status": status,
+                "source_bytes": source_bytes,
+                "text_bytes": text_bytes,
+                "compressed_bytes": 0,
+                "details": f"blocked {event.get('block_type', 'filter')}: {event.get('block_value', '')}",
+            })
+            return
         if status == "fetch_failed":
             self._count("failed")
             self._site_update(domain_for(url), pages=1, failed=1)
@@ -280,6 +303,29 @@ class CrawlJob:
                 "text_bytes": text_bytes,
                 "compressed_bytes": 0,
                 "details": str(verification.get("reason", "source check failed")),
+            })
+            return
+        if status == "code_filtered":
+            self._count("checked")
+            self._count("filtered")
+            self._count("code_filtered")
+            self._site_update(
+                host,
+                pages=1,
+                filtered=1,
+                code_filtered=1,
+                source_bytes=source_bytes,
+                text_bytes=text_bytes,
+            )
+            self._log({
+                "url": str(page.get("url") or url),
+                "site": host,
+                "status": status,
+                "verdict": verdict,
+                "source_bytes": source_bytes,
+                "text_bytes": text_bytes,
+                "compressed_bytes": 0,
+                "details": str(event.get("reason", "page is not a recognized code resource")),
             })
             return
         record = event.get("record") or {}
@@ -340,6 +386,9 @@ class CrawlJob:
                 respect_robots=config["respect_robots"],
                 human_only=config["human_only"],
                 training_mode=config["training_mode"],
+                blocked_words=config["blocked_words"],
+                blocked_sites=config["blocked_sites"],
+                code_only=config["code_only"],
                 stop_event=self.stop_event,
                 on_event=self._handle_event,
             )
@@ -604,6 +653,9 @@ def parse_start_config(payload: dict[str, Any]) -> dict[str, Any]:
         "respect_robots": not as_bool(payload.get("ignore_robots"), False),
         "human_only": as_bool(payload.get("human_only"), True),
         "training_mode": as_bool(payload.get("training_mode"), True),
+        "blocked_words": normalize_filter_values(payload.get("blocked_words")),
+        "blocked_sites": normalize_block_sites(payload.get("blocked_sites")),
+        "code_only": as_bool(payload.get("code_only"), False),
     }
 
 
@@ -767,6 +819,14 @@ td.url { max-width:360px; word-break:break-all; }
     <label>Seeds (one http(s) URL per line; checked search results are added automatically)
       <textarea id="seeds" placeholder="https://example.org/article"></textarea>
     </label>
+    <div class="row" style="margin-top:10px;align-items:start">
+      <label class="grow">Block words or phrases (one per line or comma-separated)
+        <textarea id="blockedWords" placeholder="login\nsign up\nsubscribe"></textarea>
+      </label>
+      <label class="grow">Block sites or domain paths (one per line or comma-separated)
+        <textarea id="blockedSites" placeholder="facebook.com\nexample.org/login"></textarea>
+      </label>
+    </div>
     <div class="row" style="margin-top:12px">
       <label class="grow">Archive path<input id="archive" type="text" value="knowledge.zip"></label>
       <label>Max pages<input id="maxPages" type="number" min="1" value="500"></label>
@@ -778,8 +838,10 @@ td.url { max-width:360px; word-break:break-all; }
     <div class="checks">
       <label><input id="humanOnly" type="checkbox" checked> Require human or archive provenance</label>
       <label><input id="trainingMode" type="checkbox" checked> Training mode (clean text and skip low-value files)</label>
+      <label><input id="codeOnly" type="checkbox"> Code-bearing pages only</label>
       <label><input id="followExternal" type="checkbox"> Follow external domains</label>
     </div>
+    <div class="notice">Block lists are applied before requests when a URL matches, and again to the fetched title/text. Code-only mode stores recognized source files and raw/blob pages; repository directory and login pages may be traversed for links but are never stored.</div>
     <div style="margin-top:14px">
       <button id="start" class="primary">Gather automatically</button>
       <button id="stop" class="danger">Stop</button>
@@ -794,6 +856,8 @@ td.url { max-width:360px; word-break:break-all; }
       <div class="card"><div class="name">Stored</div><div id="stored" class="value">0</div></div>
       <div class="card"><div class="name">Filtered</div><div id="filtered" class="value">0</div></div>
       <div class="card"><div class="name">Training filtered</div><div id="trainingFiltered" class="value">0</div></div>
+      <div class="card"><div class="name">Code filtered</div><div id="codeFiltered" class="value">0</div></div>
+      <div class="card"><div class="name">Blocked</div><div id="blocked" class="value">0</div></div>
       <div class="card"><div class="name">Duplicates</div><div id="duplicates" class="value">0</div></div>
       <div class="card"><div class="name">Source bytes</div><div id="sourceBytes" class="value">0 B</div></div>
       <div class="card"><div class="name">Archive size</div><div id="archiveBytes" class="value">0 B</div></div>
@@ -867,7 +931,7 @@ $('start').onclick = async () => {
   const seeds = [...new Set([...manual, ...chosen])];
   const topic = $('topic').value.trim();
   if (!seeds.length && !topic) { $('startMessage').innerHTML = '<span class="error">Enter a topic, seed URL, or select a search result.</span>'; return; }
-  const body = {topic, seeds, discover_limit:20, workers:$('workers').value, archive:$('archive').value.trim(), max_pages:$('maxPages').value, max_depth:$('maxDepth').value, delay:$('delay').value, timeout:$('timeout').value, human_only:$('humanOnly').checked, follow_external:$('followExternal').checked, training_mode:$('trainingMode').checked};
+  const body = {topic, seeds, blocked_words:$('blockedWords').value, blocked_sites:$('blockedSites').value, code_only:$('codeOnly').checked, discover_limit:20, workers:$('workers').value, archive:$('archive').value.trim(), max_pages:$('maxPages').value, max_depth:$('maxDepth').value, delay:$('delay').value, timeout:$('timeout').value, human_only:$('humanOnly').checked, follow_external:$('followExternal').checked, training_mode:$('trainingMode').checked};
   $('start').disabled = true; $('startMessage').textContent = 'Starting…';
   try { await api('/api/start',{method:'POST',body:JSON.stringify(body)}); $('startMessage').textContent='Running'; }
   catch (e) { $('startMessage').innerHTML = `<span class="error">${esc(e.message)}</span>`; }
@@ -878,7 +942,7 @@ $('stop').onclick = async () => { try { const r=await api('/api/stop',{method:'P
 function renderState(s) {
   $('state').textContent = s.state || 'idle';
   const c=s.counters||{};
-  $('checked').textContent=(c.checked||0).toLocaleString(); $('stored').textContent=(c.stored||0).toLocaleString(); $('filtered').textContent=(c.filtered||0).toLocaleString(); $('trainingFiltered').textContent=(c.training_filtered||0).toLocaleString(); $('duplicates').textContent=(c.duplicates||0).toLocaleString(); $('sourceBytes').textContent=fmt(c.source_bytes); $('archiveBytes').textContent=fmt(s.archive_bytes);
+  $('checked').textContent=(c.checked||0).toLocaleString(); $('stored').textContent=(c.stored||0).toLocaleString(); $('filtered').textContent=(c.filtered||0).toLocaleString(); $('trainingFiltered').textContent=(c.training_filtered||0).toLocaleString(); $('codeFiltered').textContent=(c.code_filtered||0).toLocaleString(); $('blocked').textContent=(c.blocked||0).toLocaleString(); $('duplicates').textContent=(c.duplicates||0).toLocaleString(); $('sourceBytes').textContent=fmt(c.source_bytes); $('archiveBytes').textContent=fmt(s.archive_bytes);
   $('current').textContent=s.current ? `Current: ${s.current}` : (s.archive ? `Archive: ${s.archive}` : '');
   const sites=Object.entries(s.sites||{}).sort((a,b)=>(b[1].source_bytes||0)-(a[1].source_bytes||0));
   $('sites').innerHTML=sites.map(([name,v])=>`<tr><td>${esc(name)}</td><td>${v.pages||0}</td><td>${v.stored||0}</td><td>${v.filtered||0}</td><td>${fmt(v.source_bytes)}</td><td>${fmt(v.text_bytes)}</td><td>${fmt(v.compressed_bytes)}</td></tr>`).join('') || '<tr><td colspan="7" class="small">No pages checked yet.</td></tr>';

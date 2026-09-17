@@ -71,6 +71,8 @@ text duplicates are stored once to avoid wasting training storage.
 python lossless_web_archive.py add https://example.com/article --archive knowledge.zip
 python lossless_web_archive.py crawl https://example.com --archive knowledge.zip \
   --max-pages 1000 --max-depth 2
+python lossless_web_archive.py crawl --topic "causes of ocean pollution" \
+  --archive ocean.zip --workers 5 --max-pages 500
 python lossless_web_archive.py inspect knowledge.zip
 python lossless_web_archive.py verify knowledge.zip
 python lossless_web_archive.py export knowledge.zip training.jsonl
@@ -87,6 +89,19 @@ older archives that predate the training metadata.
 Appending opens and closes the ZIP for each page so a successfully added page
 is immediately readable. Pre-compressing text before putting it in ZIP would
 usually save less space because ZIP would no longer see the original patterns.
+
+### Autonomous, concurrent gathering
+
+`crawl --topic` turns a short goal into ranked, diverse search seeds, then
+continues through each page's links. The crawler uses a bounded worker pool
+(`--workers`, default 5), reserves request slots per host, and writes completed
+records as soon as they finish. `--delay` is the minimum spacing between
+requests to one host; different sites proceed concurrently. Throughput is
+reported at the end and depends on network latency, robots rules, and the
+servers being contacted, so five workers is a concurrency target rather than a
+guaranteed five pages every second. Crawls use fast DEFLATE by default; the
+older `LosslessArchive(..., compression="auto")` path remains available when
+minimum archive size matters more than speed.
 
 ### Deep sites and Software Heritage
 

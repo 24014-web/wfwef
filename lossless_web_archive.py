@@ -139,6 +139,22 @@ TRACKING_QUERY_PARAMS = {
     "utm_term",
 }
 
+# Code-only mode is deliberately strict about what gets stored.  Navigation
+# pages on these hosts are still fetched when they contain links to source
+# files, but they are not written to the training archive.
+CODE_BEARING_KINDS = {"code", "source", "notebook"}
+CODE_HOSTS = {
+    "github.com",
+    "raw.githubusercontent.com",
+    "gitlab.com",
+    "bitbucket.org",
+    "archive.softwareheritage.org",
+    "sourceforge.net",
+}
+CODE_PAGE_MARKERS = (
+    "/blob/", "/raw/", "/-/blob/", "/browse/content/", "/api/1/content/",
+)
+
 METHODS: dict[str, int] = {
     "stored": ZIP_STORED,
     "deflate": ZIP_DEFLATED,
@@ -233,6 +249,136 @@ def canonicalize_url(value: str) -> str:
     pairs.sort()
     query = urllib.parse.urlencode(pairs, doseq=True)
     return urllib.parse.urlunparse((parsed.scheme.casefold(), host, path, "", query, ""))
+
+
+def normalize_filter_values(values: Iterable[str] | str | None, limit: int = 200) -> list[str]:
+    """Normalize comma/newline separated block-list values.
+
+    The crawler accepts both repeated CLI flags and multiline UI fields.  A
+    small cap keeps an accidental paste from turning every URL check into a
+    large regular-expression workload.
+    """
+    raw_values = [values] if isinstance(values, str) else list(values or [])
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_values:
+        for piece in re.split(r"[\r\n,]+", str(raw)):
+            cleaned = re.sub(r"\s+", " ", piece).strip().casefold()
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                result.append(cleaned)
+                if len(result) >= max(1, int(limit)):
+                    return result
+    return result
+
+
+def normalize_block_sites(values: Iterable[str] | str | None, limit: int = 200) -> list[str]:
+    """Normalize domain/URL block entries while retaining optional paths."""
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in normalize_filter_values(values, limit=limit):
+        candidate = value.strip().rstrip("/")
+        if not candidate:
+            continue
+        if "://" in candidate:
+            parsed = urllib.parse.urlparse(candidate)
+            host = (parsed.hostname or "").casefold()
+            path = (parsed.path or "").rstrip("/")
+            candidate = host + path if host else candidate
+        else:
+            candidate = candidate.removeprefix("//")
+            if candidate.startswith("*."):
+                candidate = candidate[2:]
+        candidate = candidate.strip().rstrip("/")
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            result.append(candidate)
+    return result
+
+
+def _block_site_matches(url: str, pattern: str) -> bool:
+    """Match a domain or optional domain path against a URL."""
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    if not host:
+        return False
+    raw = str(pattern or "").strip().casefold().rstrip("/")
+    if not raw:
+        return False
+    if "://" in raw:
+        target = urllib.parse.urlparse(raw)
+        target_host = (target.hostname or "").casefold().lstrip("*.").rstrip(".")
+        target_path = (target.path or "").rstrip("/")
+    else:
+        target = urllib.parse.urlparse("//" + raw)
+        target_host = (target.hostname or "").casefold().lstrip("*.").rstrip(".")
+        target_path = (target.path or "").rstrip("/")
+    if not target_host or not (host == target_host or host.endswith("." + target_host)):
+        return False
+    if not target_path:
+        return True
+    path = (parsed.path or "/").rstrip("/") or "/"
+    return path == target_path or path.startswith(target_path + "/")
+
+
+def _block_word_matches(text: str, term: str) -> bool:
+    """Match a configured word or phrase without matching inside a word."""
+    candidate = re.sub(r"\s+", " ", str(term or "").strip().casefold())
+    if not candidate:
+        return False
+    haystack = re.sub(r"\s+", " ", str(text or "").casefold())
+    if re.fullmatch(r"[\w\s-]+", candidate, flags=re.UNICODE):
+        pattern = re.escape(candidate).replace(r"\ ", r"\s+")
+        return re.search(r"(?<!\w)" + pattern + r"(?!\w)", haystack, flags=re.UNICODE) is not None
+    return candidate in haystack
+
+
+def block_reason_for_url(url: str, blocked_sites: Iterable[str] | None = None, blocked_words: Iterable[str] | None = None) -> tuple[str, str] | None:
+    """Return ``(reason, value)`` when a URL matches a configured block."""
+    for site in blocked_sites or ():
+        if _block_site_matches(url, str(site)):
+            return "site", str(site)
+    parsed = urllib.parse.urlparse(url)
+    url_blob = f"{parsed.netloc}{parsed.path}?{parsed.query}".casefold()
+    for word in blocked_words or ():
+        if _block_word_matches(url_blob, str(word)):
+            return "word", str(word)
+    return None
+
+
+def block_reason_for_page(page: dict[str, Any], blocked_words: Iterable[str] | None = None) -> tuple[str, str] | None:
+    """Check a fetched page's URL, title, and visible text for block words."""
+    url = str(page.get("url", ""))
+    url_reason = block_reason_for_url(url, blocked_words=blocked_words)
+    if url_reason:
+        return url_reason
+    title = str(page.get("title", ""))
+    text = str(page.get("text", ""))[:100_000]
+    for word in blocked_words or ():
+        if _block_word_matches(f"{title}\n{text}", str(word)):
+            return "word", str(word)
+    return None
+
+
+def page_has_code(page: dict[str, Any]) -> bool:
+    """Return whether a page is a code/source resource worth storing.
+
+    Repository and archive directory pages are navigation only.  They remain
+    crawlable so their raw/blob/content links can be reached, but code-only
+    mode stores only source-bearing pages and known raw code endpoints.
+    """
+    kind = str(page.get("content_kind", "") or "").casefold()
+    if kind in CODE_BEARING_KINDS:
+        return True
+    url = str(page.get("url", ""))
+    parsed = urllib.parse.urlparse(url)
+    path = parsed.path.casefold()
+    if _text_extension(url) in CODE_EXTENSIONS:
+        return True
+    host = (parsed.hostname or "").casefold()
+    if host in CODE_HOSTS and any(marker in path for marker in CODE_PAGE_MARKERS):
+        return True
+    return False
 
 
 def keyword_score(blob: str, keywords: dict[str, int]) -> int:
@@ -1821,6 +1967,9 @@ def run_parallel_crawl(
     respect_robots: bool = True,
     human_only: bool = False,
     training_mode: bool = True,
+    blocked_words: Iterable[str] | None = None,
+    blocked_sites: Iterable[str] | None = None,
+    code_only: bool = False,
     stop_event: threading.Event | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
@@ -1837,6 +1986,9 @@ def run_parallel_crawl(
     safe_workers = max(1, min(int(workers), 64))
     safe_timeout = max(1.0, float(timeout))
     safe_delay = max(0.0, float(delay))
+    safe_blocked_words = normalize_filter_values(blocked_words)
+    safe_blocked_sites = normalize_block_sites(blocked_sites)
+    safe_code_only = bool(code_only)
     manual_seeds: list[str] = []
     seed_values = [seeds] if isinstance(seeds, str) else list(seeds or [])
     for value in seed_values:
@@ -1928,6 +2080,23 @@ def run_parallel_crawl(
                     stats["duplicate_urls"] += 1
                     continue
                 visited.add(visit_key)
+                block_reason = block_reason_for_url(
+                    url,
+                    blocked_sites=safe_blocked_sites,
+                    blocked_words=safe_blocked_words,
+                )
+                if block_reason:
+                    reason_type, reason_value = block_reason
+                    stats["blocked"] += 1
+                    stats[f"blocked_{reason_type}s"] += 1
+                    emit({
+                        "status": "blocked",
+                        "url": url,
+                        "depth": depth,
+                        "block_type": reason_type,
+                        "block_value": reason_value,
+                    })
+                    continue
                 if not follow_external and not same_host(url, seed_hosts):
                     stats["out_of_scope"] += 1
                     emit({"status": "out_of_scope", "url": url, "depth": depth})
@@ -1966,6 +2135,23 @@ def run_parallel_crawl(
                 text_bytes = len(str(page.get("text", "")).encode("utf-8"))
                 stats["source_bytes"] += source_bytes
                 stats["text_bytes"] += text_bytes
+                page_block_reason = block_reason_for_page(page, safe_blocked_words)
+                if page_block_reason:
+                    reason_type, reason_value = page_block_reason
+                    stats["blocked"] += 1
+                    stats[f"blocked_{reason_type}s"] += 1
+                    emit({
+                        "status": "blocked",
+                        "url": page_url,
+                        "depth": depth,
+                        "host": host,
+                        "page": page,
+                        "block_type": reason_type,
+                        "block_value": reason_value,
+                        "source_bytes": source_bytes,
+                        "text_bytes": text_bytes,
+                    })
+                    continue
                 training = dict(page.get("training") or {})
                 if training_mode and not training.get("include", True):
                     stats["training_filtered"] += 1
@@ -1996,8 +2182,26 @@ def run_parallel_crawl(
                         "source_bytes": source_bytes,
                         "text_bytes": text_bytes,
                     })
-                    if page.get("deep_search"):
+                    # Code-only crawls may need to traverse an unverified
+                    # repository directory to reach its raw/blob files.
+                    if page.get("deep_search") or safe_code_only:
                         enqueue(page_url, page.get("links", []), depth)
+                    continue
+                if safe_code_only and not page_has_code(page):
+                    stats["code_filtered"] += 1
+                    emit({
+                        "status": "code_filtered",
+                        "url": page_url,
+                        "depth": depth,
+                        "host": host,
+                        "page": page,
+                        "training": training,
+                        "verification": verification,
+                        "source_bytes": source_bytes,
+                        "text_bytes": text_bytes,
+                        "reason": "page is not a recognized source/code resource; links were retained for deeper traversal",
+                    })
+                    enqueue(page_url, page.get("links", []), depth)
                     continue
                 record = make_record(page, depth=depth)
                 result = archive.add(record)
@@ -2036,6 +2240,9 @@ def run_parallel_crawl(
     stats["methods"] = dict(methods)
     stats["topics"] = dict(topics)
     stats["discovered"] = len(discovered)
+    stats["blocked_words"] = list(safe_blocked_words)
+    stats["blocked_sites"] = list(safe_blocked_sites)
+    stats["code_only"] = int(safe_code_only)
     return dict(stats)
 
 
@@ -2148,6 +2355,13 @@ def command_crawl(args: argparse.Namespace) -> int:
             print(f"Skipped {url}: {verification.get('reason', 'source check failed')}")
         elif status == "fetch_failed":
             print(f"Fetch failed {url}: {event.get('error', 'request failed')}", file=sys.stderr)
+        elif status == "blocked":
+            print(
+                f"Blocked {url} ({event.get('block_type', 'filter')}: "
+                f"{event.get('block_value', '')})"
+            )
+        elif status == "code_filtered":
+            print(f"Skipped non-code page {url}")
 
     try:
         stats = run_parallel_crawl(
@@ -2164,6 +2378,9 @@ def command_crawl(args: argparse.Namespace) -> int:
             respect_robots=args.respect_robots,
             human_only=args.human_only,
             training_mode=args.training_mode,
+            blocked_words=args.blocked_words,
+            blocked_sites=args.blocked_sites,
+            code_only=args.code_only,
             on_event=report,
         )
     except (OSError, ValueError, RuntimeError) as exc:
@@ -2173,6 +2390,8 @@ def command_crawl(args: argparse.Namespace) -> int:
         f"Attempted: {stats.get('attempted', 0):,}; checked: {stats.get('checked', 0):,}; "
         f"stored unique pages: {stats.get('stored', 0):,}; "
         f"training-filtered: {stats.get('training_filtered', 0):,}; "
+        f"code-filtered: {stats.get('code_filtered', 0):,}; "
+        f"blocked: {stats.get('blocked', 0):,}; "
         f"duplicates skipped: {stats.get('duplicates', 0):,}"
     )
     print(f"Archive: {Path(args.archive).resolve()}")
@@ -2181,6 +2400,14 @@ def command_crawl(args: argparse.Namespace) -> int:
     if stats.get("topics"):
         print("Topics: " + ", ".join(f"{key}={value}" for key, value in Counter(stats["topics"]).most_common()))
     print(f"Throughput: {stats.get('pages_per_second', 0):.2f} attempted page(s)/second with {args.workers} worker(s)")
+    if args.blocked_words or args.blocked_sites:
+        print(
+            "Block lists: "
+            f"{len(args.blocked_words or []):,} word(s), "
+            f"{len(args.blocked_sites or []):,} site(s)"
+        )
+    if args.code_only:
+        print("Code-only mode: enabled (navigation pages were traversed but not stored)")
     return 0
 
 
@@ -2347,6 +2574,25 @@ def build_parser() -> argparse.ArgumentParser:
     crawl.add_argument("--timeout", type=float, default=20.0)
     crawl.add_argument("--workers", type=int, default=5, help="concurrent fetch workers (default: 5)")
     crawl.add_argument("--delay", type=float, default=0.05, help="minimum seconds between requests to the same host")
+    crawl.add_argument(
+        "--block-word",
+        dest="blocked_words",
+        action="append",
+        default=[],
+        help="skip URLs/pages containing this word or phrase; repeat or separate with commas",
+    )
+    crawl.add_argument(
+        "--block-site",
+        dest="blocked_sites",
+        action="append",
+        default=[],
+        help="skip this domain (or domain/path); repeat or separate with commas",
+    )
+    crawl.add_argument(
+        "--code-only",
+        action="store_true",
+        help="store only recognized source/code pages while traversing navigation pages for links",
+    )
     crawl.add_argument("--follow-external", action="store_true")
     crawl.add_argument(
         "--raw-visible",

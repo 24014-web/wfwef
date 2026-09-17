@@ -8,7 +8,9 @@ results, and start an appendable full-text crawl.
 The source check is deliberately conservative and explainable.  It can find
 explicit AI-generation disclosures, authorship/publication metadata, and a
 small set of known public-archive provenance signals, but no web page can
-prove that every sentence was written by a person.
+prove that every sentence was written by a person.  A crawl can also start
+from a short topic, discover seeds automatically, and fetch several sites in
+parallel.
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ from lossless_web_archive import (
     make_record,
     normalize_url,
     robots_allowed,
+    run_parallel_crawl,
     same_host,
     swh_frontload,
     software_heritage_search,
@@ -182,167 +185,175 @@ class CrawlJob:
         with self.lock:
             self.counters[key] += amount
 
-    def _run(self, config: dict[str, Any]) -> None:
-        seeds = [normalize_url(value) for value in config["seeds"]]
-        seeds = [value for value in seeds if value]
-        seed_hosts = {urllib.parse.urlparse(seed).netloc.lower() for seed in seeds}
-        pending: deque[tuple[str, int]] = deque((seed, 0) for seed in seeds)
-        visited: set[str] = set()
-        robots_cache: dict[str, Any] = {}
-        try:
-            archive = LosslessArchive(config["archive"])
-            while pending and not self.stop_event.is_set():
-                if self.counters["checked"] >= config["max_pages"]:
-                    break
-                url, depth = pending.popleft()
-                visit_key = canonicalize_url(url) or url
-                if visit_key in visited:
-                    continue
-                visited.add(visit_key)
-                if not config["follow_external"] and not same_host(url, seed_hosts):
-                    self._count("out_of_scope")
-                    continue
-                self._set_current(url)
-                if config["respect_robots"] and not robots_allowed(
-                    url, robots_cache, "lossless-web-archive-ui", config["timeout"]
-                ):
-                    self._count("robots_blocked")
-                    self._log({
-                        "url": url,
-                        "site": domain_for(url),
-                        "status": "robots_blocked",
-                        "source_bytes": 0,
-                        "text_bytes": 0,
-                        "compressed_bytes": 0,
-                        "details": "robots.txt disallowed this URL",
-                    })
-                    continue
-                page = fetch_full_page(url, config["timeout"], training_mode=config["training_mode"])
-                if page is None:
-                    self._count("failed")
-                    self._site_update(domain_for(url), pages=1, failed=1)
-                    self._log({
-                        "url": url,
-                        "site": domain_for(url),
-                        "status": "fetch_failed",
-                        "source_bytes": 0,
-                        "text_bytes": 0,
-                        "compressed_bytes": 0,
-                        "details": "request failed, unsupported content, or too little text",
-                    })
-                    continue
-                self._count("checked")
-                host = domain_for(page["url"])
-                source_bytes = int(page.get("source_bytes", 0))
-                training = dict(page.get("training") or {})
-                if config["training_mode"] and not training.get("include", True):
-                    self._count("training_filtered")
-                    filtered_text_bytes = len(str(page.get("text", "")).encode("utf-8"))
-                    self._site_update(
-                        host,
-                        pages=1,
-                        filtered=1,
-                        source_bytes=source_bytes,
-                        text_bytes=filtered_text_bytes,
-                    )
-                    reasons = ", ".join(str(value) for value in training.get("reasons", [])) or "training quality gate"
-                    tree = page.get("archive_tree") or {}
-                    tree_note = f"; archive tree {tree.get('files', 0):,} file link(s)" if tree else ""
-                    self._log({
-                        "url": page["url"],
-                        "site": host,
-                        "status": "training_filtered",
-                        "verdict": str((page.get("source_verification") or {}).get("verdict", "unknown")),
-                        "source_bytes": source_bytes,
-                        "text_bytes": filtered_text_bytes,
-                        "compressed_bytes": 0,
-                        "details": f"{reasons}; score {training.get('score', 0)}/100{tree_note}",
-                    })
-                    self._enqueue(pending, page["url"], page.get("links", []), depth, config, seed_hosts)
-                    continue
-                verification = dict(page.get("source_verification", {}))
-                verdict = str(verification.get("verdict", "unknown"))
-                if config["human_only"] and verdict not in {"human_signals", "archive_signals"}:
-                    self._count("filtered")
-                    filtered_text_bytes = len(str(page.get("text", "")).encode("utf-8"))
-                    self._site_update(
-                        host,
-                        pages=1,
-                        filtered=1,
-                        source_bytes=source_bytes,
-                        text_bytes=filtered_text_bytes,
-                    )
-                    self._log({
-                        "url": page["url"],
-                        "site": host,
-                        "status": "filtered",
-                        "verdict": verdict,
-                        "source_bytes": source_bytes,
-                        "text_bytes": filtered_text_bytes,
-                        "compressed_bytes": 0,
-                    "details": str(verification.get("reason", "source check failed")),
-                    })
-                    # A JavaScript search shell may be unknown while its
-                    # adapter has discovered exact archive links.  Continue
-                    # only that explicit machine-readable frontier when the
-                    # shell itself is filtered.
-                    if page.get("deep_search"):
-                        self._enqueue(pending, page["url"], page.get("links", []), depth, config, seed_hosts)
-                    continue
+    def _handle_event(self, event: dict[str, Any]) -> None:
+        """Translate coordinator events into the live UI counters and log."""
+        status = str(event.get("status", ""))
+        url = str(event.get("url", ""))
+        if url:
+            self._set_current(url)
+        if status == "discovery":
+            self._count("discovered", int(event.get("count", 0)))
+            self._log({
+                "url": "",
+                "site": "topic discovery",
+                "status": "discovery",
+                "source_bytes": 0,
+                "text_bytes": 0,
+                "compressed_bytes": 0,
+                "details": f"{event.get('count', 0)} seed(s) for {event.get('topic', '')}",
+            })
+            return
+        if status == "discovery_failed":
+            self._log({
+                "url": "",
+                "site": "topic discovery",
+                "status": "discovery_failed",
+                "source_bytes": 0,
+                "text_bytes": 0,
+                "compressed_bytes": 0,
+                "details": str(event.get("error", "topic discovery failed")),
+            })
+            return
+        if status == "out_of_scope":
+            self._count("out_of_scope")
+            return
+        if status == "robots_blocked":
+            self._count("robots_blocked")
+            self._log({
+                "url": url,
+                "site": domain_for(url),
+                "status": status,
+                "source_bytes": 0,
+                "text_bytes": 0,
+                "compressed_bytes": 0,
+                "details": "robots.txt disallowed this URL",
+            })
+            return
+        if status == "fetch_failed":
+            self._count("failed")
+            self._site_update(domain_for(url), pages=1, failed=1)
+            self._log({
+                "url": url,
+                "site": domain_for(url),
+                "status": status,
+                "source_bytes": 0,
+                "text_bytes": 0,
+                "compressed_bytes": 0,
+                "details": str(event.get("error", "request failed, unsupported content, or too little text")),
+            })
+            return
+        page = event.get("page") or {}
+        host = str(event.get("host") or domain_for(str(page.get("url") or url)))
+        source_bytes = int(event.get("source_bytes", page.get("source_bytes", 0)) or 0)
+        text_bytes = int(event.get("text_bytes", len(str(page.get("text", "")).encode("utf-8"))) or 0)
+        training = dict(event.get("training") or page.get("training") or {})
+        if status == "training_filtered":
+            self._count("checked")
+            self._count("training_filtered")
+            self._site_update(host, pages=1, filtered=1, source_bytes=source_bytes, text_bytes=text_bytes)
+            reasons = ", ".join(str(value) for value in training.get("reasons", [])) or "training quality gate"
+            tree = page.get("archive_tree") or {}
+            tree_note = f"; archive tree {tree.get('files', 0):,} file link(s)" if tree else ""
+            self._log({
+                "url": str(page.get("url") or url),
+                "site": host,
+                "status": status,
+                "verdict": str((page.get("source_verification") or {}).get("verdict", "unknown")),
+                "source_bytes": source_bytes,
+                "text_bytes": text_bytes,
+                "compressed_bytes": 0,
+                "details": f"{reasons}; score {training.get('score', 0)}/100{tree_note}",
+            })
+            return
+        verification = dict(event.get("verification") or page.get("source_verification") or {})
+        verdict = str(verification.get("verdict", "unknown"))
+        if status == "filtered":
+            self._count("checked")
+            self._count("filtered")
+            self._site_update(host, pages=1, filtered=1, source_bytes=source_bytes, text_bytes=text_bytes)
+            self._log({
+                "url": str(page.get("url") or url),
+                "site": host,
+                "status": status,
+                "verdict": verdict,
+                "source_bytes": source_bytes,
+                "text_bytes": text_bytes,
+                "compressed_bytes": 0,
+                "details": str(verification.get("reason", "source check failed")),
+            })
+            return
+        record = event.get("record") or {}
+        result = event.get("archive_result") or {}
+        self._count("checked")
+        compressed_bytes = int(event.get("compressed_bytes", result.get("member_bytes", 0)) or 0)
+        if status == "duplicate":
+            self._count("duplicates")
+            self._site_update(host, pages=1, duplicates=1, source_bytes=source_bytes, text_bytes=text_bytes)
+        elif status == "stored":
+            self._count("stored")
+            self._count("source_bytes", source_bytes)
+            self._count("text_bytes", text_bytes)
+            self._count("compressed_bytes", compressed_bytes)
+            self._site_update(
+                host,
+                pages=1,
+                stored=1,
+                source_bytes=source_bytes,
+                text_bytes=text_bytes,
+                compressed_bytes=compressed_bytes,
+            )
+        else:
+            return
+        self._log({
+            "url": str(page.get("url") or url),
+            "site": host,
+            "status": status,
+            "verdict": verdict,
+            "source_bytes": source_bytes,
+            "text_bytes": text_bytes,
+            "compressed_bytes": compressed_bytes,
+            "method": result.get("method", ""),
+            "topic": record.get("topic", "other"),
+            "document_type": record.get("document_type", "article"),
+            "details": "; ".join(
+                item for item in (
+                    str(verification.get("reason", "")),
+                    f"training score {training.get('score', 0)}/100" if training else "",
+                    f"duplicate by {result.get('duplicate_reason')}" if result.get("duplicate") else "",
+                ) if item
+            ),
+        })
 
-                record = make_record(page, depth=depth)
-                result = archive.add(record)
-                text_bytes = int(record.get("text_bytes", 0))
-                if result["duplicate"]:
-                    self._count("duplicates")
-                    self._site_update(
-                        host,
-                        pages=1,
-                        duplicates=1,
-                        source_bytes=source_bytes,
-                        text_bytes=text_bytes,
-                    )
-                    status = "duplicate"
-                    compressed_bytes = 0
-                else:
-                    self._count("stored")
-                    compressed_bytes = int(result.get("member_bytes", 0))
-                    self._count("source_bytes", source_bytes)
-                    self._count("text_bytes", text_bytes)
-                    self._count("compressed_bytes", compressed_bytes)
-                    self._site_update(
-                        host,
-                        pages=1,
-                        stored=1,
-                        source_bytes=source_bytes,
-                        text_bytes=text_bytes,
-                        compressed_bytes=compressed_bytes,
-                    )
-                    status = "stored"
-                self._log({
-                    "url": page["url"],
-                    "site": host,
-                    "status": status,
-                    "verdict": verdict,
-                    "source_bytes": source_bytes,
-                    "text_bytes": text_bytes,
-                    "compressed_bytes": compressed_bytes,
-                    "method": result.get("method", ""),
-                    "topic": record.get("topic", "other"),
-                    "document_type": record.get("document_type", "article"),
-                    "details": "; ".join(
-                        item for item in (
-                            str(verification.get("reason", "")),
-                            f"training score {training.get('score', 0)}/100" if training else "",
-                            f"duplicate by {result.get('duplicate_reason')}" if result.get("duplicate") else "",
-                        ) if item
-                    ),
-                })
-                self._enqueue(pending, page["url"], page.get("links", []), depth, config, seed_hosts)
-                if config["delay"]:
-                    time.sleep(config["delay"])
+    def _run(self, config: dict[str, Any]) -> None:
+        try:
+            stats = run_parallel_crawl(
+                config.get("seeds", []),
+                topic=str(config.get("topic", "")),
+                archive_path=config["archive"],
+                max_pages=config["max_pages"],
+                max_depth=config["max_depth"],
+                timeout=config["timeout"],
+                delay=config["delay"],
+                workers=config["workers"],
+                discover_limit=config["discover_limit"],
+                follow_external=config["follow_external"],
+                respect_robots=config["respect_robots"],
+                human_only=config["human_only"],
+                training_mode=config["training_mode"],
+                stop_event=self.stop_event,
+                on_event=self._handle_event,
+            )
             with self.lock:
                 self.state = "stopped" if self.stop_event.is_set() else "done"
+            self._log({
+                "url": "",
+                "site": "crawl",
+                "status": "complete" if not self.stop_event.is_set() else "stopped",
+                "source_bytes": 0,
+                "text_bytes": 0,
+                "compressed_bytes": 0,
+                "details": f"{stats.get('attempted', 0):,} attempted at {stats.get('pages_per_second', 0):.2f} page(s)/second",
+            })
         except Exception as exc:  # expose a useful UI error and stop cleanly
             with self.lock:
                 self.state = "error"
@@ -575,16 +586,20 @@ def parse_start_config(payload: dict[str, Any]) -> dict[str, Any]:
         normalized = normalize_url(str(value).strip())
         if normalized and normalized not in seeds:
             seeds.append(normalized)
-    if not seeds:
-        raise ValueError("Add at least one valid http(s) seed URL")
+    topic = str(payload.get("topic", "")).strip()
+    if not seeds and not topic:
+        raise ValueError("Add a seed URL or a topic to discover sources")
     archive = str(payload.get("archive", "knowledge.zip")).strip() or "knowledge.zip"
     return {
         "seeds": seeds,
+        "topic": topic,
         "archive": archive,
         "max_pages": bounded_int(payload.get("max_pages"), 500, 1, 100_000),
         "max_depth": bounded_int(payload.get("max_depth"), 2, 0, 20),
         "timeout": bounded_float(payload.get("timeout"), 20.0, 1.0, 120.0),
-        "delay": bounded_float(payload.get("delay"), 0.25, 0.0, 60.0),
+        "delay": bounded_float(payload.get("delay"), 0.05, 0.0, 60.0),
+        "workers": bounded_int(payload.get("workers"), 5, 1, 64),
+        "discover_limit": bounded_int(payload.get("discover_limit"), 20, 1, 100),
         "follow_external": as_bool(payload.get("follow_external"), False),
         "respect_robots": not as_bool(payload.get("ignore_robots"), False),
         "human_only": as_bool(payload.get("human_only"), True),
@@ -739,13 +754,16 @@ td.url { max-width:360px; word-break:break-all; }
       </label>
       <button id="search">Search web</button>
     </div>
-    <div class="notice">Source screening is a heuristic. It rejects explicit AI-generation disclosures and accepts authorship/publication signals or a known public-archive provenance signal; no webpage can prove that AI was never used. Training mode also removes page chrome, unwraps archived source files, and skips generated assets. Software Heritage directories are expanded through their API, so nested repository files count as one logical depth.</div>
+    <div class="notice">Source screening is a heuristic. It rejects explicit AI-generation disclosures and accepts authorship/publication signals or a known public-archive provenance signal; no webpage can prove that AI was never used. Enter a topic to discover sources automatically, or paste seeds directly. Fetch workers run concurrently while the host delay spaces requests to the same site. Software Heritage directories are expanded through their API, so nested repository files count as one logical depth.</div>
     <div id="searchMessage" class="small"></div>
     <div id="results"></div>
   </section>
 
   <section class="panel">
     <h2>2. Crawl selected pages</h2>
+    <label class="grow">Topic / gathering goal (optional; sources are discovered automatically)
+      <input id="topic" type="text" placeholder="e.g. causes of ocean pollution, or Python reinforcement learning">
+    </label>
     <label>Seeds (one http(s) URL per line; checked search results are added automatically)
       <textarea id="seeds" placeholder="https://example.org/article"></textarea>
     </label>
@@ -753,7 +771,8 @@ td.url { max-width:360px; word-break:break-all; }
       <label class="grow">Archive path<input id="archive" type="text" value="knowledge.zip"></label>
       <label>Max pages<input id="maxPages" type="number" min="1" value="500"></label>
       <label>Max depth<input id="maxDepth" type="number" min="0" value="2"></label>
-      <label>Delay (seconds)<input id="delay" type="number" min="0" step="0.1" value="0.25"></label>
+      <label>Workers<input id="workers" type="number" min="1" max="64" value="5"></label>
+      <label>Host delay (seconds)<input id="delay" type="number" min="0" step="0.01" value="0.05"></label>
       <label>Timeout (seconds)<input id="timeout" type="number" min="1" value="20"></label>
     </div>
     <div class="checks">
@@ -762,7 +781,7 @@ td.url { max-width:360px; word-break:break-all; }
       <label><input id="followExternal" type="checkbox"> Follow external domains</label>
     </div>
     <div style="margin-top:14px">
-      <button id="start" class="primary">Start crawl</button>
+      <button id="start" class="primary">Gather automatically</button>
       <button id="stop" class="danger">Stop</button>
       <span id="startMessage" class="status"></span>
     </div>
@@ -846,8 +865,9 @@ $('start').onclick = async () => {
   const chosen = [...document.querySelectorAll('.result-check:checked')].map(box => lastResults[Number(box.dataset.index)]?.url).filter(Boolean);
   const manual = $('seeds').value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
   const seeds = [...new Set([...manual, ...chosen])];
-  if (!seeds.length) { $('startMessage').innerHTML = '<span class="error">Add a seed URL or select a search result.</span>'; return; }
-  const body = {seeds, archive:$('archive').value.trim(), max_pages:$('maxPages').value, max_depth:$('maxDepth').value, delay:$('delay').value, timeout:$('timeout').value, human_only:$('humanOnly').checked, follow_external:$('followExternal').checked, training_mode:$('trainingMode').checked};
+  const topic = $('topic').value.trim();
+  if (!seeds.length && !topic) { $('startMessage').innerHTML = '<span class="error">Enter a topic, seed URL, or select a search result.</span>'; return; }
+  const body = {topic, seeds, discover_limit:20, workers:$('workers').value, archive:$('archive').value.trim(), max_pages:$('maxPages').value, max_depth:$('maxDepth').value, delay:$('delay').value, timeout:$('timeout').value, human_only:$('humanOnly').checked, follow_external:$('followExternal').checked, training_mode:$('trainingMode').checked};
   $('start').disabled = true; $('startMessage').textContent = 'Starting…';
   try { await api('/api/start',{method:'POST',body:JSON.stringify(body)}); $('startMessage').textContent='Running'; }
   catch (e) { $('startMessage').innerHTML = `<span class="error">${esc(e.message)}</span>`; }

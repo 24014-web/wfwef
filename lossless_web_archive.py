@@ -18,6 +18,8 @@ Examples::
         --archive knowledge.zip
     python lossless_web_archive.py crawl https://example.com \
         --archive knowledge.zip --max-pages 1000 --max-depth 2
+    python lossless_web_archive.py crawl --topic "causes of ocean pollution" \
+        --archive ocean.zip --workers 5
     python lossless_web_archive.py inspect knowledge.zip
     python lossless_web_archive.py export knowledge.zip training.jsonl
     python lossless_web_archive.py verify knowledge.zip
@@ -26,19 +28,21 @@ Examples::
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import hashlib
 import html
 import json
 import posixpath
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 import urllib.parse
 from collections import Counter, deque
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterable, Iterator
 from zipfile import (
     ZIP_BZIP2,
     ZIP_DEFLATED,
@@ -1606,12 +1610,24 @@ def archive_header() -> bytes:
 
 
 class LosslessArchive:
-    """Small append API that commits each page as a ZIP member."""
+    """Small append API that commits each page as a ZIP member.
 
-    def __init__(self, path: str | Path, deduplicate: bool = True) -> None:
+    ``compression='deflate'`` is the fast crawl default.  ``auto`` keeps the
+    older smallest-member selection, which measures DEFLATE, BZIP2, and LZMA
+    for every record and therefore costs more CPU.
+    """
+
+    def __init__(self, path: str | Path, deduplicate: bool = True, compression: str = "auto") -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.deduplicate = deduplicate
+        chosen_compression = str(compression or "auto").casefold()
+        if chosen_compression != "auto" and chosen_compression not in METHODS:
+            raise ValueError(f"Unknown compression method: {compression}")
+        self.compression = chosen_compression
+        # Crawls fetch in parallel.  ZIP central-directory updates and the
+        # in-memory duplicate indexes must still be one writer at a time.
+        self._lock = threading.RLock()
         self.known_hashes: set[str] = set()
         self.known_urls: set[str] = set()
         self.known_names: set[str] = set()
@@ -1640,42 +1656,387 @@ class LosslessArchive:
             self.known_names.add(ARCHIVE_META)
 
     def add(self, record: dict[str, Any]) -> dict[str, Any]:
-        digest = str(record["text_sha256"])
-        canonical = str(record.get("canonical_url") or canonicalize_url(record.get("url", "")))
-        if canonical and not record.get("canonical_url"):
-            record["canonical_url"] = canonical
-        if self.deduplicate and canonical and canonical in self.known_urls:
-            return {"stored": False, "duplicate": True, "duplicate_reason": "url", "hash": digest}
-        if self.deduplicate and digest in self.known_hashes:
-            return {"stored": False, "duplicate": True, "duplicate_reason": "text", "hash": digest}
-        topic = slug(str(record.get("topic", "other")))
-        chosen, payload, sizes = choose_method(record)
-        entry_name = f"{RECORD_PREFIX}{topic}/{digest}.json"
-        # Opening and closing the ZIP for each page writes a fresh central
-        # directory, so a successfully returned add() is immediately readable.
-        with ZipFile(self.path, "a", compression=ZIP_DEFLATED, compresslevel=9, allowZip64=True) as archive:
-            if entry_name in archive.namelist():
+        with self._lock:
+            digest = str(record["text_sha256"])
+            canonical = str(record.get("canonical_url") or canonicalize_url(record.get("url", "")))
+            if canonical and not record.get("canonical_url"):
+                record["canonical_url"] = canonical
+            if self.deduplicate and canonical and canonical in self.known_urls:
+                return {"stored": False, "duplicate": True, "duplicate_reason": "url", "hash": digest}
+            if self.deduplicate and digest in self.known_hashes:
                 return {"stored": False, "duplicate": True, "duplicate_reason": "text", "hash": digest}
-            archive.writestr(
-                entry_name,
-                payload,
-                compress_type=METHODS[chosen],
-                compresslevel=9,
-            )
-        self.known_names.add(entry_name)
-        self.known_hashes.add(digest)
-        if canonical:
-            self.known_urls.add(canonical)
-        return {
-            "stored": True,
-            "duplicate": False,
-            "hash": digest,
-            "entry": entry_name,
-            "method": chosen,
-            "member_bytes": sizes[chosen],
-            "raw_bytes": len(payload),
+            topic = slug(str(record.get("topic", "other")))
+            if self.compression == "auto":
+                chosen, payload, sizes = choose_method(record)
+            else:
+                chosen = self.compression
+                candidate = dict(record)
+                candidate["compression"] = chosen
+                payload = serialize(candidate)
+                sizes = {chosen: 0}
+            entry_name = f"{RECORD_PREFIX}{topic}/{digest}.json"
+            # Opening and closing the ZIP for each page writes a fresh central
+            # directory, so a successfully returned add() is immediately readable.
+            with ZipFile(self.path, "a", compression=ZIP_DEFLATED, compresslevel=9, allowZip64=True) as archive:
+                if entry_name in archive.namelist():
+                    return {"stored": False, "duplicate": True, "duplicate_reason": "text", "hash": digest}
+                archive.writestr(
+                    entry_name,
+                    payload,
+                    compress_type=METHODS[chosen],
+                    compresslevel=9,
+                )
+                sizes[chosen] = archive.getinfo(entry_name).compress_size
+            self.known_names.add(entry_name)
+            self.known_hashes.add(digest)
+            if canonical:
+                self.known_urls.add(canonical)
+            return {
+                "stored": True,
+                "duplicate": False,
+                "hash": digest,
+                "entry": entry_name,
+                "method": chosen,
+                "member_bytes": sizes[chosen],
+                "raw_bytes": len(payload),
             "all_sizes": sizes,
         }
+
+
+def _topic_tokens(topic: str) -> list[str]:
+    return [
+        token.casefold()
+        for token in re.findall(r"[^\W_]+", str(topic or ""), flags=re.UNICODE)
+        if len(token) > 1
+    ]
+
+
+def discover_topic_sources(topic: str, limit: int = 20, timeout: float = 20.0) -> list[dict[str, Any]]:
+    """Turn a short gathering goal into ranked, diverse crawl seeds.
+
+    Discovery stays dependency-free by reusing the local HTML search adapter.
+    The crawler still fetches and verifies each selected page before storing it;
+    search-result text is never treated as training content.
+    """
+    cleaned = re.sub(r"\s+", " ", str(topic or "")).strip()
+    if not cleaned:
+        return []
+    from local_opinion_ai import search_web
+
+    safe_limit = max(1, min(int(limit), 100))
+    candidates = search_web(cleaned, limit=max(safe_limit * 2, 12), timeout=timeout)
+    if not isinstance(candidates, list):
+        return []
+    terms = _topic_tokens(cleaned)
+    low_value_hosts = {
+        "facebook.com", "instagram.com", "pinterest.com", "tiktok.com",
+        "twitter.com", "x.com", "youtube.com",
+    }
+
+    def rank(item: dict[str, Any]) -> tuple[int, str]:
+        title = str(item.get("title", ""))
+        url = str(item.get("url", ""))
+        blob = f"{title} {url}".casefold()
+        parsed = urllib.parse.urlparse(url)
+        host = (parsed.hostname or "").casefold()
+        score = sum(3 if token in title.casefold() else 1 if token in blob else 0 for token in terms)
+        if host.endswith((".edu", ".gov", ".org")):
+            score += 2
+        if any(part in parsed.path.casefold() for part in ("article", "research", "paper", "report", "docs", "wiki")):
+            score += 1
+        if any(host == blocked or host.endswith("." + blocked) for blocked in low_value_hosts):
+            score -= 4
+        return score, url
+
+    ordered: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in sorted((value for value in candidates if isinstance(value, dict)), key=rank, reverse=True):
+        url = normalize_url(str(item.get("url", "")))
+        if not url:
+            continue
+        key = canonicalize_url(url) or url
+        if key in seen:
+            continue
+        seen.add(key)
+        copy = dict(item)
+        copy["url"] = url
+        copy["discovery_score"] = rank(copy)[0]
+        ordered.append(copy)
+
+    # Prefer different sites early so the worker pool can make progress across
+    # several hosts.  A second pass fills the requested limit with more pages
+    # from a strong source when discovery returned too few domains.
+    selected: list[dict[str, Any]] = []
+    host_counts: Counter[str] = Counter()
+    for item in ordered:
+        host = urllib.parse.urlparse(item["url"]).netloc.casefold()
+        if host_counts[host]:
+            continue
+        selected.append(item)
+        host_counts[host] += 1
+        if len(selected) >= safe_limit:
+            break
+    if len(selected) < safe_limit:
+        for item in ordered:
+            if item not in selected:
+                selected.append(item)
+            if len(selected) >= safe_limit:
+                break
+    return selected[:safe_limit]
+
+
+class HostRateLimiter:
+    """Reserve request slots per host without serializing different sites."""
+
+    def __init__(self, interval: float = 0.0) -> None:
+        self.interval = max(0.0, float(interval))
+        self._lock = threading.Lock()
+        self._next_allowed: dict[str, float] = {}
+
+    def wait(self, url: str) -> None:
+        if self.interval <= 0:
+            return
+        host = urllib.parse.urlparse(url).netloc.casefold()
+        with self._lock:
+            now = time.monotonic()
+            slot = max(now, self._next_allowed.get(host, now))
+            self._next_allowed[host] = slot + self.interval
+        remaining = slot - now
+        if remaining > 0:
+            time.sleep(remaining)
+
+
+def run_parallel_crawl(
+    seeds: Iterable[str] | None = None,
+    *,
+    topic: str = "",
+    archive_path: str | Path = "knowledge.zip",
+    max_pages: int = 500,
+    max_depth: int = 2,
+    timeout: float = 20.0,
+    delay: float = 0.05,
+    workers: int = 5,
+    discover_limit: int = 20,
+    follow_external: bool = False,
+    respect_robots: bool = True,
+    human_only: bool = False,
+    training_mode: bool = True,
+    stop_event: threading.Event | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Crawl a dynamic frontier with bounded concurrent fetch workers.
+
+    The callback is invoked from the coordinator thread after each completed
+    request, so callers can update a UI without sharing mutable archive state
+    with network workers.  ``delay`` is the minimum spacing between requests
+    to the same host; different hosts proceed concurrently.
+    """
+    stop_event = stop_event or threading.Event()
+    safe_max_pages = max(1, int(max_pages))
+    safe_max_depth = max(0, int(max_depth))
+    safe_workers = max(1, min(int(workers), 64))
+    safe_timeout = max(1.0, float(timeout))
+    safe_delay = max(0.0, float(delay))
+    manual_seeds: list[str] = []
+    seed_values = [seeds] if isinstance(seeds, str) else list(seeds or [])
+    for value in seed_values:
+        normalized = normalize_url(str(value).strip())
+        if normalized and normalized not in manual_seeds:
+            manual_seeds.append(normalized)
+
+    def emit(event: dict[str, Any]) -> None:
+        if on_event is not None:
+            on_event(event)
+
+    discovered: list[dict[str, Any]] = []
+    if str(topic or "").strip():
+        try:
+            discovered = discover_topic_sources(str(topic), discover_limit, safe_timeout)
+            emit({
+                "status": "discovery",
+                "topic": str(topic).strip(),
+                "count": len(discovered),
+                "results": discovered,
+            })
+            for item in discovered:
+                url = normalize_url(str(item.get("url", "")))
+                if url and url not in manual_seeds:
+                    manual_seeds.append(url)
+        except Exception as exc:
+            emit({
+                "status": "discovery_failed",
+                "topic": str(topic).strip(),
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+            if not manual_seeds:
+                raise ValueError(f"Topic discovery failed: {type(exc).__name__}") from exc
+    if not manual_seeds:
+        raise ValueError("Provide at least one valid http(s) seed URL or a topic to discover")
+
+    seed_hosts = {urllib.parse.urlparse(seed).netloc.casefold() for seed in manual_seeds}
+    pending: deque[tuple[str, int]] = deque((seed, 0) for seed in manual_seeds)
+    visited: set[str] = set()
+    robots_cache: dict[str, Any] = {}
+    limiter = HostRateLimiter(safe_delay)
+    archive = LosslessArchive(archive_path, compression="deflate")
+    methods: Counter[str] = Counter()
+    topics: Counter[str] = Counter()
+    stats: Counter[str] = Counter()
+    started = time.monotonic()
+
+    def enqueue(page_url: str, links: list[str], depth: int) -> None:
+        children = crawl_children(
+            page_url,
+            links,
+            depth,
+            safe_max_depth,
+            seed_hosts,
+            follow_external,
+        )
+        if swh_frontload(page_url):
+            for child in reversed(children):
+                pending.appendleft(child)
+        else:
+            pending.extend(children)
+
+    def fetch_one(url: str, depth: int) -> dict[str, Any]:
+        try:
+            limiter.wait(url)
+            if stop_event.is_set():
+                return {"url": url, "depth": depth, "cancelled": True, "page": None}
+            return {
+                "url": url,
+                "depth": depth,
+                "page": fetch_full_page(url, safe_timeout, training_mode=training_mode),
+            }
+        except Exception as exc:
+            return {
+                "url": url,
+                "depth": depth,
+                "page": None,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+    scheduled = 0
+    inflight: dict[Any, tuple[str, int]] = {}
+    with ThreadPoolExecutor(max_workers=safe_workers, thread_name_prefix="web-fetch") as executor:
+        while (pending or inflight) and not stop_event.is_set():
+            while pending and len(inflight) < safe_workers and scheduled < safe_max_pages and not stop_event.is_set():
+                url, depth = pending.popleft()
+                visit_key = canonicalize_url(url) or url
+                if visit_key in visited:
+                    stats["duplicate_urls"] += 1
+                    continue
+                visited.add(visit_key)
+                if not follow_external and not same_host(url, seed_hosts):
+                    stats["out_of_scope"] += 1
+                    emit({"status": "out_of_scope", "url": url, "depth": depth})
+                    continue
+                if respect_robots and not robots_allowed(url, robots_cache, "lossless-web-archive", safe_timeout):
+                    stats["robots_blocked"] += 1
+                    emit({"status": "robots_blocked", "url": url, "depth": depth})
+                    continue
+                scheduled += 1
+                stats["scheduled"] = scheduled
+                future = executor.submit(fetch_one, url, depth)
+                inflight[future] = (url, depth)
+            if not inflight:
+                break
+            done, _ = wait(tuple(inflight), return_when=FIRST_COMPLETED)
+            for future in done:
+                url, depth = inflight.pop(future)
+                outcome = future.result()
+                stats["attempted"] += 1
+                if outcome.get("cancelled"):
+                    continue
+                page = outcome.get("page")
+                if page is None:
+                    stats["failed"] += 1
+                    emit({
+                        "status": "fetch_failed",
+                        "url": url,
+                        "depth": depth,
+                        "error": outcome.get("error", "request failed or unsupported content"),
+                    })
+                    continue
+                stats["checked"] += 1
+                page_url = str(page.get("url") or url)
+                host = urllib.parse.urlparse(page_url).netloc.casefold() or "(local)"
+                source_bytes = int(page.get("source_bytes", 0))
+                text_bytes = len(str(page.get("text", "")).encode("utf-8"))
+                stats["source_bytes"] += source_bytes
+                stats["text_bytes"] += text_bytes
+                training = dict(page.get("training") or {})
+                if training_mode and not training.get("include", True):
+                    stats["training_filtered"] += 1
+                    emit({
+                        "status": "training_filtered",
+                        "url": page_url,
+                        "depth": depth,
+                        "host": host,
+                        "page": page,
+                        "training": training,
+                        "source_bytes": source_bytes,
+                        "text_bytes": text_bytes,
+                    })
+                    enqueue(page_url, page.get("links", []), depth)
+                    continue
+                verification = dict(page.get("source_verification", {}))
+                verdict = str(verification.get("verdict", "unknown"))
+                if human_only and verdict not in {"human_signals", "archive_signals"}:
+                    stats["filtered"] += 1
+                    emit({
+                        "status": "filtered",
+                        "url": page_url,
+                        "depth": depth,
+                        "host": host,
+                        "page": page,
+                        "training": training,
+                        "verification": verification,
+                        "source_bytes": source_bytes,
+                        "text_bytes": text_bytes,
+                    })
+                    if page.get("deep_search"):
+                        enqueue(page_url, page.get("links", []), depth)
+                    continue
+                record = make_record(page, depth=depth)
+                result = archive.add(record)
+                if result["duplicate"]:
+                    stats["duplicates"] += 1
+                    status = "duplicate"
+                    compressed_bytes = 0
+                else:
+                    stats["stored"] += 1
+                    compressed_bytes = int(result.get("member_bytes", 0))
+                    stats["compressed_bytes"] += compressed_bytes
+                    methods[str(result.get("method", ""))] += 1
+                    topics[str(record.get("topic", "other"))] += 1
+                    status = "stored"
+                emit({
+                    "status": status,
+                    "url": page_url,
+                    "depth": depth,
+                    "host": host,
+                    "page": page,
+                    "record": record,
+                    "archive_result": result,
+                    "training": training,
+                    "verification": verification,
+                    "source_bytes": source_bytes,
+                    "text_bytes": text_bytes,
+                    "compressed_bytes": compressed_bytes,
+                })
+                enqueue(page_url, page.get("links", []), depth)
+
+    elapsed = max(0.001, time.monotonic() - started)
+    stats["elapsed_seconds"] = round(elapsed, 3)
+    stats["pages_per_second"] = round(stats["attempted"] / elapsed, 2)
+    stats["stopped"] = int(stop_event.is_set())
+    stats["archive"] = str(Path(archive_path).resolve())
+    stats["methods"] = dict(methods)
+    stats["topics"] = dict(topics)
+    stats["discovered"] = len(discovered)
+    return dict(stats)
 
 
 def iter_record_infos(archive: ZipFile) -> Iterator[Any]:
@@ -1766,97 +2127,60 @@ def command_add(args: argparse.Namespace) -> int:
 
 
 def command_crawl(args: argparse.Namespace) -> int:
-    seeds = [normalize_url(value) for value in args.seeds]
-    seeds = [value for value in seeds if value]
-    if not seeds:
-        print("Provide at least one valid http(s) seed URL.", file=sys.stderr)
-        return 1
-    seed_hosts = {urllib.parse.urlparse(seed).netloc.lower() for seed in seeds}
-    pending: deque[tuple[str, int]] = deque((seed, 0) for seed in seeds)
-    visited: set[str] = set()
-    robots_cache: dict[str, Any] = {}
-    methods: Counter[str] = Counter()
-    topics: Counter[str] = Counter()
-    fetched = stored = duplicates = training_filtered = 0
-
-    def enqueue(page_url: str, links: list[str], depth: int) -> None:
-        children = crawl_children(
-            page_url,
-            links,
-            depth,
-            args.max_depth,
-            seed_hosts,
-            args.follow_external,
-        )
-        if swh_frontload(page_url):
-            for child in reversed(children):
-                pending.appendleft(child)
-        else:
-            pending.extend(children)
+    def report(event: dict[str, Any]) -> None:
+        status = str(event.get("status", ""))
+        url = str(event.get("url", ""))
+        if status == "discovery":
+            print(f"Discovered {int(event.get('count', 0)):,} source seed(s) for topic: {event.get('topic', '')}")
+        elif status == "discovery_failed":
+            print(f"Topic discovery failed: {event.get('error', 'unknown error')}", file=sys.stderr)
+        elif status == "training_filtered":
+            training = event.get("training") or {}
+            tree = (event.get("page") or {}).get("archive_tree") or {}
+            tree_note = f"; archive tree {tree.get('files', 0):,} file link(s)" if tree else ""
+            print(
+                f"Skipped training-low-value page {url}: "
+                + ", ".join(str(value) for value in training.get("reasons", []))
+                + tree_note
+            )
+        elif status == "filtered":
+            verification = event.get("verification") or {}
+            print(f"Skipped {url}: {verification.get('reason', 'source check failed')}")
+        elif status == "fetch_failed":
+            print(f"Fetch failed {url}: {event.get('error', 'request failed')}", file=sys.stderr)
 
     try:
-        archive = LosslessArchive(args.archive)
-        while pending and fetched < args.max_pages:
-            url, depth = pending.popleft()
-            visit_key = canonicalize_url(url) or url
-            if visit_key in visited:
-                continue
-            visited.add(visit_key)
-            if not args.follow_external and not same_host(url, seed_hosts):
-                continue
-            if args.respect_robots and not robots_allowed(
-                url, robots_cache, "lossless-web-archive", args.timeout
-            ):
-                continue
-            page = fetch_full_page(url, args.timeout, training_mode=args.training_mode)
-            if page is None:
-                continue
-            fetched += 1
-            training = dict(page.get("training") or {})
-            if args.training_mode and not training.get("include", True):
-                training_filtered += 1
-                tree = page.get("archive_tree") or {}
-                tree_note = f"; archive tree {tree.get('files', 0):,} file link(s)" if tree else ""
-                print(
-                    f"Skipped training-low-value page {page.get('url', url)}: "
-                    + ", ".join(str(value) for value in training.get("reasons", []))
-                    + tree_note
-                )
-                enqueue(page["url"], page.get("links", []), depth)
-                continue
-            verification = dict(page.get("source_verification", {}))
-            if args.human_only and str(verification.get("verdict", "unknown")) not in {"human_signals", "archive_signals"}:
-                print(f"Skipped {page.get('url', url)}: {verification.get('reason', 'source check failed')}")
-                # A JavaScript search shell can be unknown while its adapter
-                # has already discovered exact archive links.  Continue only
-                # that explicit machine-readable frontier when the shell
-                # itself is filtered.
-                if page.get("deep_search"):
-                    enqueue(page["url"], page.get("links", []), depth)
-                continue
-            record = make_record(page, depth=depth)
-            result = archive.add(record)
-            if result["duplicate"]:
-                duplicates += 1
-            else:
-                stored += 1
-                methods[str(result["method"])] += 1
-                topics[str(record["topic"])] += 1
-            enqueue(page["url"], page.get("links", []), depth)
-            if args.delay:
-                time.sleep(args.delay)
+        stats = run_parallel_crawl(
+            args.seeds,
+            topic=args.topic,
+            archive_path=args.archive,
+            max_pages=args.max_pages,
+            max_depth=args.max_depth,
+            timeout=args.timeout,
+            delay=args.delay,
+            workers=args.workers,
+            discover_limit=args.discover_limit,
+            follow_external=args.follow_external,
+            respect_robots=args.respect_robots,
+            human_only=args.human_only,
+            training_mode=args.training_mode,
+            on_event=report,
+        )
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"Crawl failed: {exc}", file=sys.stderr)
         return 1
     print(
-        f"Fetched: {fetched:,}; stored unique pages: {stored:,}; "
-        f"training-filtered: {training_filtered:,}; duplicates skipped: {duplicates:,}"
+        f"Attempted: {stats.get('attempted', 0):,}; checked: {stats.get('checked', 0):,}; "
+        f"stored unique pages: {stats.get('stored', 0):,}; "
+        f"training-filtered: {stats.get('training_filtered', 0):,}; "
+        f"duplicates skipped: {stats.get('duplicates', 0):,}"
     )
     print(f"Archive: {Path(args.archive).resolve()}")
-    if methods:
-        print("Compression methods: " + ", ".join(f"{key}={value}" for key, value in sorted(methods.items())))
-    if topics:
-        print("Topics: " + ", ".join(f"{key}={value}" for key, value in topics.most_common()))
+    if stats.get("methods"):
+        print("Compression methods: " + ", ".join(f"{key}={value}" for key, value in sorted(stats["methods"].items())))
+    if stats.get("topics"):
+        print("Topics: " + ", ".join(f"{key}={value}" for key, value in Counter(stats["topics"]).most_common()))
+    print(f"Throughput: {stats.get('pages_per_second', 0):.2f} attempted page(s)/second with {args.workers} worker(s)")
     return 0
 
 
@@ -2013,13 +2337,16 @@ def build_parser() -> argparse.ArgumentParser:
     add.set_defaults(training_mode=True)
     add.set_defaults(func=command_add)
 
-    crawl = sub.add_parser("crawl", help="crawl seeds and append each complete page immediately")
-    crawl.add_argument("seeds", nargs="+")
+    crawl = sub.add_parser("crawl", help="crawl seeds or discover sources from a topic")
+    crawl.add_argument("seeds", nargs="*", help="one or more starting URLs (optional when --topic is used)")
+    crawl.add_argument("--topic", help="short gathering goal; discover and crawl matching public sources")
+    crawl.add_argument("--discover-limit", type=int, default=20, help="maximum topic-discovery seeds (default: 20)")
     crawl.add_argument("--archive", default="knowledge.zip")
     crawl.add_argument("--max-pages", type=int, default=500)
     crawl.add_argument("--max-depth", type=int, default=2)
     crawl.add_argument("--timeout", type=float, default=20.0)
-    crawl.add_argument("--delay", type=float, default=0.25)
+    crawl.add_argument("--workers", type=int, default=5, help="concurrent fetch workers (default: 5)")
+    crawl.add_argument("--delay", type=float, default=0.05, help="minimum seconds between requests to the same host")
     crawl.add_argument("--follow-external", action="store_true")
     crawl.add_argument(
         "--raw-visible",
